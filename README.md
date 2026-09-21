@@ -1,7 +1,7 @@
 # DynamicGeometry
 
-DynamicGeometry is a small, UI-independent Swift engine for building interactive geometric
-constructions from reusable points, circles, segments, lines, rays, and derived points.
+DynamicGeometry is a UI-independent Swift engine for building interactive mathematical
+constructions from reusable geometry, scalar expressions, and explicit dependencies.
 
 The engine stores relationships instead of frozen drawing coordinates. Move a free point or a
 point constrained to a circle, and every dependent projection or segment resolves from the new
@@ -14,6 +14,10 @@ geometry. A host app remains responsible for rendering, gestures, selection, and
 - Free points and points constrained to a circle
 - Horizontal and vertical projected points
 - A dependency-aware scene with missing-reference and cycle detection
+- Incremental affected-branch evaluation with deterministic change reports
+- Versioned scene encoding with migration from the unversioned foundation schema
+- Codable scalar parameters and expression trees with structured evaluation outcomes
+- Framework-independent affine coordinate transforms
 - Drag projection for both Cartesian and screen-y-down coordinate systems
 - No UI framework, storage, analytics, or application-specific dependency
 
@@ -31,7 +35,8 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 https://github.com/kodlabs-in/DynamicGeometry.git
 ```
 
-Select version `0.1.0` or add it to `Package.swift`:
+Version `0.1.0` is the published foundation release. The enhanced expression, transform, and
+incremental-evaluation APIs are currently unreleased. For the foundation, add:
 
 ```swift
 dependencies: [
@@ -65,6 +70,30 @@ For a touch-driven canvas whose y-axis points down, create the scene with
 ```swift
 try scene.movePoint(movingPoint, to: dragLocation)
 ```
+
+Hosts that need targeted redraw or undo information can use the reporting mutation:
+
+```swift
+let change = try scene.movePointReportingChanges(movingPoint, to: dragLocation)
+redraw(ids: change.affectedEntityIDs)
+```
+
+## Scalar expressions
+
+Scalar expressions are data, not executable scripts. They are Codable and return explicit states
+for approximate, undefined, unsupported, nonconvergent, and pending results.
+
+```swift
+let theta = try ScalarParameter(name: "theta", value: .pi / 4)
+let sine = ScalarExpression.function(
+  .sine,
+  argument: .parameter(.identified(theta.id)))
+
+let result = sine.evaluate(parameters: [theta])
+```
+
+Use `CoordinateTransform2D` to move between mathematical, page, and viewport coordinates without
+introducing a Core Graphics or SwiftUI dependency into the engine.
 
 See [DynamicGeometrySandbox](https://github.com/kodlabs-in/DynamicGeometrySandbox) for a runnable
 unit-circle construction.

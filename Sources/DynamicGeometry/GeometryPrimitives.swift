@@ -29,6 +29,9 @@ public enum GeometryError: Error, Equatable, LocalizedError, Sendable {
   /// Encoded scene storage and its display order do not contain the same identifiers.
   case inconsistentScene
 
+  /// The encoded scene was produced by a newer, unsupported schema.
+  case unsupportedSchemaVersion(Int)
+
   /// A human-readable description of the geometry failure.
   public var errorDescription: String? {
     switch self {
@@ -50,6 +53,8 @@ public enum GeometryError: Error, Equatable, LocalizedError, Sendable {
       "A direction requires two distinct points."
     case .inconsistentScene:
       "The scene order does not match its stored entities."
+    case .unsupportedSchemaVersion(let version):
+      "Scene schema version \(version) is not supported."
     }
   }
 }

@@ -2,19 +2,26 @@ import Foundation
 
 /// A Codable collection of geometric entities whose relationships resolve on demand.
 public struct GeometryScene: Codable, Equatable, Sendable {
+  /// The schema version written by this release.
+  public static let currentSchemaVersion = 1
+
   /// The coordinate orientation shared by angular entities in this scene.
   public let coordinateSystem: CoordinateSystem2D
 
   /// Entity identifiers in stable display and serialization order.
   public private(set) var orderedIDs: [GeometryID]
 
-  private var entities: [GeometryID: GeometryEntity]
+  var entities: [GeometryID: GeometryEntity]
+  var reverseDependencies: [GeometryID: Set<GeometryID>]
+  var resolvedEntities: [GeometryID: ResolvedGeometry]
 
   /// Creates an empty scene using Cartesian coordinates by default.
   public init(coordinateSystem: CoordinateSystem2D = .cartesian) {
     self.coordinateSystem = coordinateSystem
     orderedIDs = []
     entities = [:]
+    reverseDependencies = [:]
+    resolvedEntities = [:]
   }
 
   /// Returns the stored definition for an entity without resolving its dependencies.
@@ -86,82 +93,113 @@ public struct GeometryScene: Codable, Equatable, Sendable {
 
   /// Replaces one entity while preserving its identifier and scene order.
   public mutating func replace(_ id: GeometryID, with entity: GeometryEntity) throws {
+    _ = try replaceReportingChanges(id, with: entity)
+  }
+
+  /// Replaces one entity and reports the mutation root and all transitive dependents.
+  @discardableResult
+  public mutating func replaceReportingChanges(
+    _ id: GeometryID,
+    with entity: GeometryEntity
+  ) throws -> GeometrySceneChange {
     guard let previous = entities[id] else {
       throw GeometryError.missingEntity(id)
     }
     entities[id] = entity
+    updateReverseDependencies(for: id, from: previous.dependencyIDs, to: entity.dependencyIDs)
+    let affectedEntityIDs = affectedEntityIDs(startingAt: id)
     do {
-      try validate()
+      try resolveAndCache(affectedEntityIDs)
     } catch {
       entities[id] = previous
+      updateReverseDependencies(for: id, from: entity.dependencyIDs, to: previous.dependencyIDs)
       throw error
     }
+    return GeometrySceneChange(affectedEntityIDs: affectedEntityIDs)
   }
 
   /// Removes an entity when no remaining entity depends on it.
   public mutating func remove(_ id: GeometryID) throws {
-    guard let previous = entities.removeValue(forKey: id) else {
+    guard let previous = entities[id] else {
+      throw GeometryError.missingEntity(id)
+    }
+    guard reverseDependencies[id, default: []].isEmpty else {
       throw GeometryError.missingEntity(id)
     }
     guard let previousIndex = orderedIDs.firstIndex(of: id) else {
-      entities[id] = previous
       throw GeometryError.inconsistentScene
     }
+    entities.removeValue(forKey: id)
     orderedIDs.remove(at: previousIndex)
-    do {
-      try validate()
-    } catch {
-      orderedIDs.insert(id, at: previousIndex)
-      entities[id] = previous
-      throw error
-    }
+    resolvedEntities.removeValue(forKey: id)
+    updateReverseDependencies(for: id, from: previous.dependencyIDs, to: [])
   }
 
   /// Resolves a point and all of its dependencies.
   public func point(_ id: GeometryID) throws -> Point2D {
+    if case .point(let point) = resolvedEntities[id] { return point }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolvePoint(id, visiting: &visiting)
+    return try resolvePoint(id, visiting: &visiting, cache: &cache)
   }
 
   /// Resolves a circle and its centre point.
   public func circle(_ id: GeometryID) throws -> Circle2D {
+    if case .circle(let circle) = resolvedEntities[id] { return circle }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolveCircle(id, visiting: &visiting)
+    return try resolveCircle(id, visiting: &visiting, cache: &cache)
   }
 
   /// Resolves an ellipse and its centre point.
   public func ellipse(_ id: GeometryID) throws -> Ellipse2D {
+    if case .ellipse(let ellipse) = resolvedEntities[id] { return ellipse }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolveEllipse(id, visiting: &visiting)
+    return try resolveEllipse(id, visiting: &visiting, cache: &cache)
   }
 
   /// Resolves a segment and both endpoints.
   public func segment(_ id: GeometryID) throws -> Segment2D {
+    if case .segment(let segment) = resolvedEntities[id] { return segment }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolveSegment(id, visiting: &visiting)
+    return try resolveSegment(id, visiting: &visiting, cache: &cache)
   }
 
   /// Resolves an infinite line and its two defining points.
   public func line(_ id: GeometryID) throws -> Line2D {
+    if case .line(let line) = resolvedEntities[id] { return line }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolveLine(id, visiting: &visiting)
+    return try resolveLine(id, visiting: &visiting, cache: &cache)
   }
 
   /// Resolves a ray and its two defining points.
   public func ray(_ id: GeometryID) throws -> Ray2D {
+    if case .ray(let ray) = resolvedEntities[id] { return ray }
+    var cache = resolvedEntities
     var visiting: Set<GeometryID> = []
-    return try resolveRay(id, visiting: &visiting)
+    return try resolveRay(id, visiting: &visiting, cache: &cache)
   }
 
   /// Moves a free point directly or projects a circle-constrained point onto its circle.
   public mutating func movePoint(_ id: GeometryID, to target: Point2D) throws {
+    _ = try movePointReportingChanges(id, to: target)
+  }
+
+  /// Moves a point and reports the point and every transitive dependent in scene order.
+  @discardableResult
+  public mutating func movePointReportingChanges(
+    _ id: GeometryID,
+    to target: Point2D
+  ) throws -> GeometrySceneChange {
     guard target.isFinite else {
       throw GeometryError.nonFiniteValue("Drag location")
     }
     guard case .point(let definition) = entities[id] else {
       throw try typeError(for: id, expected: "point")
     }
-
     let replacement: PointDefinition
     switch definition {
     case .free:
@@ -172,187 +210,43 @@ public struct GeometryScene: Codable, Equatable, Sendable {
     case .horizontalProjection, .verticalProjection:
       throw GeometryError.readOnlyPoint(id)
     }
-    try replace(id, with: .point(replacement))
+    return try replaceReportingChanges(id, with: .point(replacement))
   }
 
   /// Validates scene identity, every dependency, and every resolved numeric value.
   public func validate() throws {
-    guard orderedIDs.count == Set(orderedIDs).count else {
-      throw GeometryError.inconsistentScene
-    }
-    guard Set(orderedIDs) == Set(entities.keys) else {
-      throw GeometryError.inconsistentScene
-    }
+    try validateIdentity()
+    var cache: [GeometryID: ResolvedGeometry] = [:]
     for id in orderedIDs {
-      try validateEntity(id)
+      try validateEntity(id, cache: &cache)
     }
   }
 }
 
 private extension GeometryScene {
   @discardableResult
-  private mutating func insert(_ entity: GeometryEntity, id: GeometryID) throws -> GeometryID {
+  mutating func insert(_ entity: GeometryEntity, id: GeometryID) throws -> GeometryID {
     guard entities[id] == nil else {
       throw GeometryError.duplicateEntity(id)
     }
     entities[id] = entity
     orderedIDs.append(id)
+    updateReverseDependencies(for: id, from: [], to: entity.dependencyIDs)
     do {
-      try validate()
+      try resolveAndCache([id])
       return id
     } catch {
+      updateReverseDependencies(for: id, from: entity.dependencyIDs, to: [])
       entities.removeValue(forKey: id)
       orderedIDs.removeAll { $0 == id }
       throw error
     }
   }
-
-  private func validateEntity(_ id: GeometryID) throws {
-    guard let entity = entities[id] else {
-      throw GeometryError.missingEntity(id)
-    }
-    switch entity {
-    case .point:
-      _ = try point(id)
-    case .circle:
-      _ = try circle(id)
-    case .ellipse:
-      _ = try ellipse(id)
-    case .segment:
-      _ = try segment(id)
-    case .line:
-      _ = try line(id)
-    case .ray:
-      _ = try ray(id)
-    }
-  }
-
-  private func resolvePoint(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Point2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .point(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "point")
-    }
-    switch definition {
-    case .free(let point):
-      guard point.isFinite else {
-        throw GeometryError.nonFiniteValue("Point")
-      }
-      return point
-    case .onCircle(let circleID, let angleRadians):
-      let circle = try resolveCircle(circleID, visiting: &visiting)
-      return try circle.point(at: angleRadians, coordinateSystem: coordinateSystem)
-    case .horizontalProjection(let sourceID, let y):
-      guard y.isFinite else {
-        throw GeometryError.nonFiniteValue("Horizontal projection")
-      }
-      let source = try resolvePoint(sourceID, visiting: &visiting)
-      return Point2D(x: source.x, y: y)
-    case .verticalProjection(let sourceID, let x):
-      guard x.isFinite else {
-        throw GeometryError.nonFiniteValue("Vertical projection")
-      }
-      let source = try resolvePoint(sourceID, visiting: &visiting)
-      return Point2D(x: x, y: source.y)
-    }
-  }
-
-  private func resolveCircle(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Circle2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .circle(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "circle")
-    }
-    return try Circle2D(
-      center: resolvePoint(definition.center, visiting: &visiting),
-      radius: definition.radius)
-  }
-
-  private func resolveEllipse(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Ellipse2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .ellipse(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "ellipse")
-    }
-    return try Ellipse2D(
-      center: resolvePoint(definition.center, visiting: &visiting),
-      radiusX: definition.radiusX,
-      radiusY: definition.radiusY)
-  }
-
-  private func resolveSegment(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Segment2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .segment(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "segment")
-    }
-    return try Segment2D(
-      start: resolvePoint(definition.start, visiting: &visiting),
-      end: resolvePoint(definition.end, visiting: &visiting))
-  }
-
-  private func resolveLine(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Line2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .line(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "line")
-    }
-    return try Line2D(
-      first: resolvePoint(definition.first, visiting: &visiting),
-      second: resolvePoint(definition.second, visiting: &visiting))
-  }
-
-  private func resolveRay(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws -> Ray2D {
-    try beginResolving(id, visiting: &visiting)
-    defer { visiting.remove(id) }
-    guard case .ray(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "ray")
-    }
-    return try Ray2D(
-      origin: resolvePoint(definition.origin, visiting: &visiting),
-      through: resolvePoint(definition.through, visiting: &visiting))
-  }
-
-  private func beginResolving(
-    _ id: GeometryID,
-    visiting: inout Set<GeometryID>
-  ) throws {
-    guard entities[id] != nil else {
-      throw GeometryError.missingEntity(id)
-    }
-    guard visiting.insert(id).inserted else {
-      throw GeometryError.cyclicDependency(id)
-    }
-  }
-
-  private func typeError(for id: GeometryID, expected: String) throws -> GeometryError {
-    guard entities[id] != nil else {
-      throw GeometryError.missingEntity(id)
-    }
-    return GeometryError.unexpectedEntity(id, expected: expected)
-  }
 }
 
 extension GeometryScene {
   private enum CodingKeys: CodingKey {
+    case schemaVersion
     case coordinateSystem
     case orderedIDs
     case entities
@@ -361,18 +255,32 @@ extension GeometryScene {
   /// Decodes and validates a complete geometry scene.
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    let schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
+    guard (0...Self.currentSchemaVersion).contains(schemaVersion) else {
+      throw GeometryError.unsupportedSchemaVersion(schemaVersion)
+    }
     coordinateSystem = try container.decode(CoordinateSystem2D.self, forKey: .coordinateSystem)
     orderedIDs = try container.decode([GeometryID].self, forKey: .orderedIDs)
     entities = try container.decode([GeometryID: GeometryEntity].self, forKey: .entities)
-    try validate()
+    reverseDependencies = Self.makeReverseDependencies(from: entities)
+    resolvedEntities = [:]
+    try rebuildResolvedEntities()
   }
 
   /// Encodes the scene after validating every dependency and numeric value.
   public func encode(to encoder: Encoder) throws {
     try validate()
     var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
     try container.encode(coordinateSystem, forKey: .coordinateSystem)
     try container.encode(orderedIDs, forKey: .orderedIDs)
     try container.encode(entities, forKey: .entities)
+  }
+
+  /// Compares only semantic scene state; derived dependency indexes are excluded.
+  public static func == (lhs: GeometryScene, rhs: GeometryScene) -> Bool {
+    lhs.coordinateSystem == rhs.coordinateSystem
+      && lhs.orderedIDs == rhs.orderedIDs
+      && lhs.entities == rhs.entities
   }
 }
