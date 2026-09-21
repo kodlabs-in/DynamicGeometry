@@ -19,7 +19,11 @@ geometry. A host app remains responsible for rendering, gestures, selection, and
 - Recoverable exact, approximate, undefined, unsupported, nonconvergent, and pending states
 - Versioned scene encoding with migration from foundation scenes to schema version 2
 - Branch-safe explicit-curve sampling that does not draw through undefined discontinuities
+- Semantic parametric and polar curves plus bounded implicit-contour extraction
 - Semantic left, right, and midpoint Riemann sums with signed rectangles
+- Validated 3D points, vectors, affine transforms, and sampled parametric surface meshes
+- Structure-preserving symbolic simplification, differentiation, and degree-two polynomial solving
+- A bounded local solver for simultaneous scalar equalities
 - Atomic command transactions, cascade-aware deletion, and framework-independent undo/redo
 - Capability discovery and a reusable, persisted unit-circle reference construction
 - Framework-independent affine coordinate transforms
@@ -40,14 +44,14 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 https://github.com/kodlabs-in/DynamicGeometry.git
 ```
 
-Version `0.1.0` is the published foundation release. The enhanced expression, transform, and
-incremental-evaluation APIs are currently unreleased. For the foundation, add:
+Version `0.2.0` adds the advanced curve, 3D geometry, symbolic algebra, simultaneous constraint,
+expression, transform, and incremental-evaluation APIs described below. Add:
 
 ```swift
 dependencies: [
   .package(
     url: "https://github.com/kodlabs-in/DynamicGeometry.git",
-    from: "0.1.0"
+    from: "0.2.0"
   )
 ]
 ```
@@ -142,6 +146,96 @@ let sum = try RiemannSumDefinition(
 Render each entry in `samples.branches` independently. Never connect the end of one branch to the
 start of another. `sum.rectangles` preserves negative heights and `sum.signedSum` reports a
 structured numerical outcome.
+
+## Advanced curves
+
+Parametric and polar definitions preserve their mathematical meaning while leaving resolution and
+rendering to the host. Implicit contours use a bounded grid and return diagnostics for ambiguous,
+degenerate, hidden, or undefined cells instead of claiming a complete zero set.
+
+```swift
+let theta = ScalarParameterID()
+let rose = try PolarCurveDefinition(
+  radiusFunction: ScalarFunction1D(
+    independentVariableID: theta,
+    expression: .function(
+      .cosine,
+      argument: .arithmetic(
+        left: .constant(5),
+        operation: .multiplication,
+        right: .parameter(.identified(theta))))),
+  angleDomain: 0...(2 * .pi))
+
+let roseSamples = try rose.sample(sampleCount: 256)
+```
+
+Use `ParametricCurveDefinition` for `(x(t), y(t))` and `ImplicitCurveDefinition` with a
+`ScalarFunction2D` for relations such as `x² + y² - r² = 0`. Render curve branches independently
+and surface every returned diagnostic in authoring or debugging tools.
+
+## 3D geometry and surfaces
+
+`Point3D`, `Vector3D`, and `CoordinateTransform3D` are renderer-independent. A
+`ParametricSurfaceDefinition` samples `(x(u,v), y(u,v), z(u,v))` into indexed triangles with unit
+face normals. Undefined coordinates create diagnosed holes rather than invalid vertices.
+
+```swift
+let surface = try ParametricSurfaceDefinition(
+  xExpression: .parameter(.named("u")),
+  yExpression: .parameter(.named("v")),
+  zExpression: .constant(0),
+  uDomain: -1...1,
+  vDomain: -1...1)
+let mesh = try surface.sample(uSampleCount: 24, vSampleCount: 24)
+```
+
+The package does not provide a camera or renderer. Sampling is a fixed rectangular mesh, normals
+are per triangle, and no manifold or adaptive-tessellation guarantee is made.
+
+## Symbolic algebra and simultaneous constraints
+
+Supported symbolic transformations return `.exact`; requests outside the implemented algebra
+return typed `.unsupported` or `.invalid` outcomes. Differentiation supports arithmetic and the
+documented scalar functions. Polynomial solving is real, numeric-coefficient, univariate, and
+bounded to degree two.
+
+```swift
+let xID = ScalarParameterID()
+let x = ScalarExpression.parameter(.identified(xID))
+let square = ScalarExpression.arithmetic(
+  left: x,
+  operation: .power,
+  right: .constant(2))
+
+let derivative = square.differentiated(withRespectTo: xID)
+let roots = ScalarExpression.arithmetic(
+  left: square,
+  operation: .subtraction,
+  right: .constant(1))
+  .solvePolynomial(withRespectTo: xID)
+```
+
+`ScalarConstraintSystem` solves multiple equalities together with bounded damped least squares.
+Initial variable values select the local branch. A converged result satisfies the requested
+residual tolerance; it is not a proof of existence, uniqueness, or global completeness.
+
+```swift
+let yID = ScalarParameterID()
+let y = ScalarExpression.parameter(.identified(yID))
+let system = try ScalarConstraintSystem(
+  variables: [
+    ScalarParameter(id: xID, name: "x", value: 0.8),
+    ScalarParameter(id: yID, name: "y", value: 0.8),
+  ],
+  constraints: [
+    ScalarEqualityConstraint(
+      left: .arithmetic(left: square, operation: .addition, right: .arithmetic(
+        left: y, operation: .power, right: .constant(2))),
+      right: .constant(1)),
+    ScalarEqualityConstraint(left: x, right: y),
+  ])
+let outcome = system.solve()
+```
 
 ## Commands, deletion, and history
 

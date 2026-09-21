@@ -10,9 +10,19 @@ public enum GeometryCapability: String, CaseIterable, Codable, Equatable, Sendab
   case entityLine
   case entityRay
   case explicitCurves
+  case parametricCurves
+  case polarCurves
+  case implicitCurves
   case discontinuitySafeSampling
   case riemannSums
   case referenceUnitCircle
+  case geometry3D
+  case affineTransforms3D
+  case parametricSurfaces
+  case symbolicSimplification
+  case symbolicDifferentiation
+  case polynomialSolving
+  case simultaneousConstraintSolver
   case commandInsert
   case commandReplace
   case commandMovePoint
