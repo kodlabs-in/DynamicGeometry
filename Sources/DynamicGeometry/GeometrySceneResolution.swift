@@ -1,28 +1,6 @@
-/// The observable result of a successful scene mutation.
-public struct GeometrySceneChange: Equatable, Sendable {
-  /// Changed entities in stable scene order, including the mutation root and its dependents.
-  public let affectedEntityIDs: [GeometryID]
-}
-
-enum ResolvedGeometry: Equatable, Sendable {
-  case point(Point2D)
-  case circle(Circle2D)
-  case ellipse(Ellipse2D)
-  case segment(Segment2D)
-  case line(Line2D)
-  case ray(Ray2D)
-}
+import Foundation
 
 extension GeometryScene {
-  func validateIdentity() throws {
-    guard orderedIDs.count == Set(orderedIDs).count else {
-      throw GeometryError.inconsistentScene
-    }
-    guard Set(orderedIDs) == Set(entities.keys) else {
-      throw GeometryError.inconsistentScene
-    }
-  }
-
   func validateEntity(
     _ id: GeometryID,
     cache: inout [GeometryID: ResolvedGeometry]
@@ -60,31 +38,42 @@ extension GeometryScene {
     guard case .point(let definition) = entities[id] else {
       throw try typeError(for: id, expected: "point")
     }
-    let point: Point2D
-    switch definition {
-    case .free(let freePoint):
-      guard freePoint.isFinite else {
-        throw GeometryError.nonFiniteValue("Point")
-      }
-      point = freePoint
-    case .onCircle(let circleID, let angleRadians):
-      let circle = try resolveCircle(circleID, visiting: &visiting, cache: &cache)
-      point = try circle.point(at: angleRadians, coordinateSystem: coordinateSystem)
-    case .horizontalProjection(let sourceID, let y):
-      guard y.isFinite else {
-        throw GeometryError.nonFiniteValue("Horizontal projection")
-      }
-      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
-      point = Point2D(x: source.x, y: y)
-    case .verticalProjection(let sourceID, let x):
-      guard x.isFinite else {
-        throw GeometryError.nonFiniteValue("Vertical projection")
-      }
-      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
-      point = Point2D(x: x, y: source.y)
-    }
+    let point = try resolvePointDefinition(definition, visiting: &visiting, cache: &cache)
     cache[id] = .point(point)
     return point
+  }
+
+  private func resolvePointDefinition(
+    _ definition: PointDefinition,
+    visiting: inout Set<GeometryID>,
+    cache: inout [GeometryID: ResolvedGeometry]
+  ) throws -> Point2D {
+    switch definition {
+    case .free(let freePoint):
+      return freePoint
+    case .computed(let x, let y):
+      return Point2D(x: try scalarValue(x), y: try scalarValue(y))
+    case .onCircle(let circleID, let angleRadians):
+      let circle = try resolveCircle(circleID, visiting: &visiting, cache: &cache)
+      return try circle.point(at: angleRadians, coordinateSystem: coordinateSystem)
+    case .onCircleExpression(let circleID, let angleRadians):
+      let circle = try resolveCircle(circleID, visiting: &visiting, cache: &cache)
+      return try circle.point(
+        at: scalarValue(angleRadians),
+        coordinateSystem: coordinateSystem)
+    case .horizontalProjection(let sourceID, let y):
+      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
+      return Point2D(x: source.x, y: y)
+    case .horizontalProjectionExpression(let sourceID, let y):
+      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
+      return Point2D(x: source.x, y: try scalarValue(y))
+    case .verticalProjection(let sourceID, let x):
+      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
+      return Point2D(x: x, y: source.y)
+    case .verticalProjectionExpression(let sourceID, let x):
+      let source = try resolvePoint(sourceID, visiting: &visiting, cache: &cache)
+      return Point2D(x: try scalarValue(x), y: source.y)
+    }
   }
 
   func resolveCircle(
@@ -102,7 +91,7 @@ extension GeometryScene {
     }
     let circle = try Circle2D(
       center: resolvePoint(definition.center, visiting: &visiting, cache: &cache),
-      radius: definition.radius)
+      radius: scalarValue(definition.radius))
     cache[id] = .circle(circle)
     return circle
   }
@@ -122,8 +111,8 @@ extension GeometryScene {
     }
     let ellipse = try Ellipse2D(
       center: resolvePoint(definition.center, visiting: &visiting, cache: &cache),
-      radiusX: definition.radiusX,
-      radiusY: definition.radiusY)
+      radiusX: scalarValue(definition.radiusX),
+      radiusY: scalarValue(definition.radiusY))
     cache[id] = .ellipse(ellipse)
     return ellipse
   }
@@ -207,6 +196,25 @@ extension GeometryScene {
     return GeometryError.unexpectedEntity(id, expected: expected)
   }
 
+  func scalarValue(_ expression: ScalarExpression) throws -> Double {
+    for id in expression.referencedParameterIDs where parameters[id] == nil {
+      throw ScalarParameterError.missingParameter(id)
+    }
+    let bindings = orderedParameterIDs.compactMap { parameters[$0] }
+    switch expression.evaluate(parameters: bindings) {
+    case .exact(let value, _), .approximate(let value, _):
+      return value
+    case .undefined(let diagnostic):
+      throw GeometryResolutionFailure.undefined(diagnostic)
+    case .unsupported(let diagnostic):
+      throw GeometryResolutionFailure.unsupported(diagnostic)
+    case .nonconvergent(let diagnostic):
+      throw GeometryResolutionFailure.nonconvergent(diagnostic)
+    case .pending(let diagnostic):
+      throw GeometryResolutionFailure.pending(diagnostic)
+    }
+  }
+
   mutating func resolveAndCache(_ ids: [GeometryID]) throws {
     var cache = resolvedEntities
     for id in ids {
@@ -216,15 +224,42 @@ extension GeometryScene {
       try validateEntity(id, cache: &cache)
     }
     resolvedEntities = cache
+    for id in ids {
+      evaluationFailures.removeValue(forKey: id)
+    }
+  }
+
+  mutating func resolveAndCacheRecoverably(_ ids: [GeometryID]) throws {
+    var cache = resolvedEntities
+    var failures = evaluationFailures
+    for id in ids {
+      cache.removeValue(forKey: id)
+      failures.removeValue(forKey: id)
+    }
+    for id in ids {
+      do {
+        try validateEntity(id, cache: &cache)
+      } catch let failure as GeometryResolutionFailure {
+        failures[id] = failure
+      } catch let error as GeometryError {
+        guard let failure = evaluationFailure(for: error) else {
+          throw error
+        }
+        failures[id] = failure
+      }
+    }
+    resolvedEntities = cache
+    evaluationFailures = failures
   }
 
   mutating func rebuildResolvedEntities() throws {
     try validateIdentity()
-    var cache: [GeometryID: ResolvedGeometry] = [:]
-    for id in orderedIDs {
-      try validateEntity(id, cache: &cache)
+    for entity in entities.values {
+      try validateLiteralInputs(entity)
     }
-    resolvedEntities = cache
+    resolvedEntities = [:]
+    evaluationFailures = [:]
+    try resolveAndCacheRecoverably(orderedIDs)
   }
 
   mutating func updateReverseDependencies(
@@ -245,6 +280,24 @@ extension GeometryScene {
     }
   }
 
+  mutating func updateParameterDependents(
+    for id: GeometryID,
+    from oldDependencies: [ScalarParameterID],
+    to newDependencies: [ScalarParameterID]
+  ) {
+    let oldDependencySet = Set(oldDependencies)
+    let newDependencySet = Set(newDependencies)
+    for parameterID in oldDependencySet.subtracting(newDependencySet) {
+      parameterDependents[parameterID]?.remove(id)
+      if parameterDependents[parameterID]?.isEmpty == true {
+        parameterDependents.removeValue(forKey: parameterID)
+      }
+    }
+    for parameterID in newDependencySet.subtracting(oldDependencySet) {
+      parameterDependents[parameterID, default: []].insert(id)
+    }
+  }
+
   static func makeReverseDependencies(
     from entities: [GeometryID: GeometryEntity]
   ) -> [GeometryID: Set<GeometryID>] {
@@ -257,9 +310,25 @@ extension GeometryScene {
     return result
   }
 
+  static func makeParameterDependents(
+    from entities: [GeometryID: GeometryEntity]
+  ) -> [ScalarParameterID: Set<GeometryID>] {
+    var result: [ScalarParameterID: Set<GeometryID>] = [:]
+    for (id, entity) in entities {
+      for parameterID in entity.referencedParameterIDs {
+        result[parameterID, default: []].insert(id)
+      }
+    }
+    return result
+  }
+
   func affectedEntityIDs(startingAt rootID: GeometryID) -> [GeometryID] {
-    var affected: Set<GeometryID> = [rootID]
-    var pending = [rootID]
+    affectedEntityIDs(startingAt: [rootID])
+  }
+
+  func affectedEntityIDs(startingAt rootIDs: Set<GeometryID>) -> [GeometryID] {
+    var affected = rootIDs
+    var pending = Array(rootIDs)
     while let id = pending.popLast() {
       for dependentID in reverseDependencies[id, default: []]
       where affected.insert(dependentID).inserted {
@@ -268,28 +337,13 @@ extension GeometryScene {
     }
     return orderedIDs.filter { affected.contains($0) }
   }
-}
 
-extension GeometryEntity {
-  var dependencyIDs: [GeometryID] {
-    switch self {
-    case .point(.free):
-      []
-    case .point(.onCircle(let circleID, _)):
-      [circleID]
-    case .point(.horizontalProjection(let pointID, _)),
-      .point(.verticalProjection(let pointID, _)):
-      [pointID]
-    case .circle(let definition):
-      [definition.center]
-    case .ellipse(let definition):
-      [definition.center]
-    case .segment(let definition):
-      [definition.start, definition.end]
-    case .line(let definition):
-      [definition.first, definition.second]
-    case .ray(let definition):
-      [definition.origin, definition.through]
+  private func evaluationFailure(for error: GeometryError) -> GeometryResolutionFailure? {
+    switch error {
+    case .nonFiniteValue, .nonPositiveDimension, .undefinedDirection:
+      return .undefined(error.localizedDescription)
+    default:
+      return nil
     }
   }
 }

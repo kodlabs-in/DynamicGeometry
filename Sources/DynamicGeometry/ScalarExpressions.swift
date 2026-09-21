@@ -1,175 +1,5 @@
 import Foundation
 
-/// Failures raised while creating or validating scalar inputs.
-public enum ScalarValidationError: Error, Equatable, LocalizedError, Sendable {
-  /// A literal expression value was NaN or infinite.
-  case nonFiniteConstant
-
-  /// A parameter name was empty or contained only whitespace.
-  case emptyParameterName
-
-  /// A parameter value was NaN or infinite.
-  case nonFiniteParameterValue(ScalarParameterID)
-
-  /// A human-readable description of the validation failure.
-  public var errorDescription: String? {
-    switch self {
-    case .nonFiniteConstant:
-      "A scalar constant must be finite."
-    case .emptyParameterName:
-      "A scalar parameter name cannot be empty."
-    case .nonFiniteParameterValue(let id):
-      "Scalar parameter \(id) must have a finite value."
-    }
-  }
-}
-
-/// A stable, app-independent identifier for a scalar parameter.
-public struct ScalarParameterID: Codable, CustomStringConvertible, Hashable, Sendable {
-  /// The underlying universally unique identifier.
-  public let rawValue: UUID
-
-  /// Creates an identifier, generating a new UUID by default.
-  public init(rawValue: UUID = UUID()) {
-    self.rawValue = rawValue
-  }
-
-  /// A printable form of the identifier.
-  public var description: String {
-    rawValue.uuidString
-  }
-}
-
-/// A finite scalar input that expressions can share by identity or name.
-public struct ScalarParameter: Codable, Equatable, Sendable {
-  /// The stable identity of the parameter.
-  public let id: ScalarParameterID
-
-  /// The human-readable name used by named references.
-  public let name: String
-
-  /// The parameter's finite scalar value.
-  public let value: Double
-
-  /// Creates a validated scalar parameter.
-  public init(id: ScalarParameterID = ScalarParameterID(), name: String, value: Double) throws {
-    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      throw ScalarValidationError.emptyParameterName
-    }
-    guard value.isFinite else {
-      throw ScalarValidationError.nonFiniteParameterValue(id)
-    }
-    self.id = id
-    self.name = name
-    self.value = value
-  }
-
-  private enum CodingKeys: CodingKey {
-    case id
-    case name
-    case value
-  }
-
-  /// Decodes a parameter while preserving its name and finite-value invariants.
-  public init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    try self.init(
-      id: container.decode(ScalarParameterID.self, forKey: .id),
-      name: container.decode(String.self, forKey: .name),
-      value: container.decode(Double.self, forKey: .value))
-  }
-}
-
-/// A stable or human-readable reference to a scalar parameter.
-public enum ScalarParameterReference: Codable, Equatable, Sendable {
-  /// Resolves a parameter by its stable identifier.
-  case identified(ScalarParameterID)
-
-  /// Resolves a parameter by its exact name.
-  case named(String)
-}
-
-/// A supported binary arithmetic operation.
-public enum ScalarArithmeticOperator: String, Codable, Equatable, Sendable {
-  /// Adds the right operand to the left operand.
-  case addition
-
-  /// Subtracts the right operand from the left operand.
-  case subtraction
-
-  /// Multiplies the two operands.
-  case multiplication
-
-  /// Divides the left operand by the right operand.
-  case division
-
-  /// Raises the left operand to the power of the right operand.
-  case power
-}
-
-/// A supported single-argument scalar function.
-public enum ScalarFunction: String, Codable, Equatable, Sendable {
-  /// The trigonometric sine function, with a radian argument.
-  case sine
-
-  /// The trigonometric cosine function, with a radian argument.
-  case cosine
-
-  /// The trigonometric tangent function, with a radian argument.
-  case tangent
-
-  /// The nonnegative magnitude of a scalar.
-  case absoluteValue
-
-  /// The principal square root.
-  case squareRoot
-
-  /// The natural logarithm.
-  case naturalLogarithm
-
-  /// The exponential function with base e.
-  case exponential
-}
-
-/// The result of evaluating a scalar expression.
-public enum ScalarEvaluationOutcome: Codable, Equatable, Sendable {
-  /// Evaluation produced a value whose exactness is established by the expression node.
-  case exact(value: Double, diagnostic: String)
-
-  /// Evaluation produced a finite numerical approximation.
-  case approximate(value: Double, diagnostic: String)
-
-  /// Evaluation has no value for the supplied inputs.
-  case undefined(diagnostic: String)
-
-  /// The expression is valid, but this evaluator does not implement it.
-  case unsupported(diagnostic: String)
-
-  /// Evaluation did not converge to a usable value.
-  case nonconvergent(diagnostic: String)
-
-  /// Evaluation has not completed yet.
-  case pending(diagnostic: String)
-
-  /// The evaluated number when this outcome contains one; otherwise `nil`.
-  public var value: Double? {
-    switch self {
-    case .exact(let value, _), .approximate(let value, _):
-      value
-    case .undefined, .unsupported, .nonconvergent, .pending:
-      nil
-    }
-  }
-
-  /// Whether this outcome contains a numerical approximation.
-  public var isApproximate: Bool {
-    if case .approximate = self {
-      return true
-    }
-    return false
-  }
-}
-
 /// A UI-independent syntax tree for a real-valued scalar expression.
 public indirect enum ScalarExpression: Codable, Equatable, Sendable {
   /// A literal numeric value.
@@ -189,6 +19,14 @@ public indirect enum ScalarExpression: Codable, Equatable, Sendable {
 
   /// Applies a standard mathematical function to a scalar expression.
   case function(ScalarFunction, argument: ScalarExpression)
+
+  /// Stable parameter identifiers referenced by the expression, in first-use order.
+  public var referencedParameterIDs: [ScalarParameterID] {
+    var seen: Set<ScalarParameterID> = []
+    var result: [ScalarParameterID] = []
+    collectReferencedParameterIDs(into: &result, seen: &seen)
+    return result
+  }
 
   /// Evaluates the expression using the supplied scalar parameter bindings.
   public func evaluate(parameters: [ScalarParameter] = []) -> ScalarEvaluationOutcome {
@@ -291,6 +129,27 @@ public indirect enum ScalarExpression: Codable, Equatable, Sendable {
       return .undefined(diagnostic: "Arithmetic produced a non-finite result.")
     }
     return .approximate(value: result, diagnostic: "Finite floating-point arithmetic.")
+  }
+
+  private func collectReferencedParameterIDs(
+    into result: inout [ScalarParameterID],
+    seen: inout Set<ScalarParameterID>
+  ) {
+    switch self {
+    case .constant, .parameter(.named):
+      break
+    case .parameter(.identified(let id)):
+      if seen.insert(id).inserted {
+        result.append(id)
+      }
+    case .negation(let expression):
+      expression.collectReferencedParameterIDs(into: &result, seen: &seen)
+    case .arithmetic(let left, _, let right):
+      left.collectReferencedParameterIDs(into: &result, seen: &seen)
+      right.collectReferencedParameterIDs(into: &result, seen: &seen)
+    case .function(_, let argument):
+      argument.collectReferencedParameterIDs(into: &result, seen: &seen)
+    }
   }
 
   private func evaluate(

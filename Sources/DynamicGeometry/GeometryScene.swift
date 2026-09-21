@@ -3,7 +3,7 @@ import Foundation
 /// A Codable collection of geometric entities whose relationships resolve on demand.
 public struct GeometryScene: Codable, Equatable, Sendable {
   /// The schema version written by this release.
-  public static let currentSchemaVersion = 1
+  public static let currentSchemaVersion = 2
 
   /// The coordinate orientation shared by angular entities in this scene.
   public let coordinateSystem: CoordinateSystem2D
@@ -11,17 +11,27 @@ public struct GeometryScene: Codable, Equatable, Sendable {
   /// Entity identifiers in stable display and serialization order.
   public private(set) var orderedIDs: [GeometryID]
 
+  /// Scalar parameter identifiers in stable serialization order.
+  public internal(set) var orderedParameterIDs: [ScalarParameterID]
+
   var entities: [GeometryID: GeometryEntity]
+  var parameters: [ScalarParameterID: ScalarParameter]
   var reverseDependencies: [GeometryID: Set<GeometryID>]
+  var parameterDependents: [ScalarParameterID: Set<GeometryID>]
   var resolvedEntities: [GeometryID: ResolvedGeometry]
+  var evaluationFailures: [GeometryID: GeometryResolutionFailure]
 
   /// Creates an empty scene using Cartesian coordinates by default.
   public init(coordinateSystem: CoordinateSystem2D = .cartesian) {
     self.coordinateSystem = coordinateSystem
     orderedIDs = []
+    orderedParameterIDs = []
     entities = [:]
+    parameters = [:]
     reverseDependencies = [:]
+    parameterDependents = [:]
     resolvedEntities = [:]
+    evaluationFailures = [:]
   }
 
   /// Returns the stored definition for an entity without resolving its dependencies.
@@ -48,12 +58,35 @@ public struct GeometryScene: Codable, Equatable, Sendable {
     try insert(.circle(CircleDefinition(center: center, radius: radius)), id: id)
   }
 
+  /// Adds a circle with an expression-backed radius.
+  @discardableResult
+  public mutating func addCircle(
+    center: GeometryID,
+    radius: ScalarExpression,
+    id: GeometryID = GeometryID()
+  ) throws -> GeometryID {
+    try insert(.circle(CircleDefinition(center: center, radius: radius)), id: id)
+  }
+
   /// Adds an ellipse whose centre is an existing point.
   @discardableResult
   public mutating func addEllipse(
     center: GeometryID,
     radiusX: Double,
     radiusY: Double,
+    id: GeometryID = GeometryID()
+  ) throws -> GeometryID {
+    try insert(
+      .ellipse(EllipseDefinition(center: center, radiusX: radiusX, radiusY: radiusY)),
+      id: id)
+  }
+
+  /// Adds an ellipse with expression-backed radii.
+  @discardableResult
+  public mutating func addEllipse(
+    center: GeometryID,
+    radiusX: ScalarExpression,
+    radiusY: ScalarExpression,
     id: GeometryID = GeometryID()
   ) throws -> GeometryID {
     try insert(
@@ -105,14 +138,23 @@ public struct GeometryScene: Codable, Equatable, Sendable {
     guard let previous = entities[id] else {
       throw GeometryError.missingEntity(id)
     }
+    try validateLiteralInputs(entity)
     entities[id] = entity
     updateReverseDependencies(for: id, from: previous.dependencyIDs, to: entity.dependencyIDs)
+    updateParameterDependents(
+      for: id,
+      from: previous.referencedParameterIDs,
+      to: entity.referencedParameterIDs)
     let affectedEntityIDs = affectedEntityIDs(startingAt: id)
     do {
-      try resolveAndCache(affectedEntityIDs)
+      try resolveAndCacheRecoverably(affectedEntityIDs)
     } catch {
       entities[id] = previous
       updateReverseDependencies(for: id, from: entity.dependencyIDs, to: previous.dependencyIDs)
+      updateParameterDependents(
+        for: id,
+        from: entity.referencedParameterIDs,
+        to: previous.referencedParameterIDs)
       throw error
     }
     return GeometrySceneChange(affectedEntityIDs: affectedEntityIDs)
@@ -132,7 +174,9 @@ public struct GeometryScene: Codable, Equatable, Sendable {
     entities.removeValue(forKey: id)
     orderedIDs.remove(at: previousIndex)
     resolvedEntities.removeValue(forKey: id)
+    evaluationFailures.removeValue(forKey: id)
     updateReverseDependencies(for: id, from: previous.dependencyIDs, to: [])
+    updateParameterDependents(for: id, from: previous.referencedParameterIDs, to: [])
   }
 
   /// Resolves a point and all of its dependencies.
@@ -183,44 +227,6 @@ public struct GeometryScene: Codable, Equatable, Sendable {
     return try resolveRay(id, visiting: &visiting, cache: &cache)
   }
 
-  /// Moves a free point directly or projects a circle-constrained point onto its circle.
-  public mutating func movePoint(_ id: GeometryID, to target: Point2D) throws {
-    _ = try movePointReportingChanges(id, to: target)
-  }
-
-  /// Moves a point and reports the point and every transitive dependent in scene order.
-  @discardableResult
-  public mutating func movePointReportingChanges(
-    _ id: GeometryID,
-    to target: Point2D
-  ) throws -> GeometrySceneChange {
-    guard target.isFinite else {
-      throw GeometryError.nonFiniteValue("Drag location")
-    }
-    guard case .point(let definition) = entities[id] else {
-      throw try typeError(for: id, expected: "point")
-    }
-    let replacement: PointDefinition
-    switch definition {
-    case .free:
-      replacement = .free(target)
-    case .onCircle(let circleID, _):
-      let angle = try circle(circleID).angle(toward: target, coordinateSystem: coordinateSystem)
-      replacement = .onCircle(circle: circleID, angleRadians: angle)
-    case .horizontalProjection, .verticalProjection:
-      throw GeometryError.readOnlyPoint(id)
-    }
-    return try replaceReportingChanges(id, with: .point(replacement))
-  }
-
-  /// Validates scene identity, every dependency, and every resolved numeric value.
-  public func validate() throws {
-    try validateIdentity()
-    var cache: [GeometryID: ResolvedGeometry] = [:]
-    for id in orderedIDs {
-      try validateEntity(id, cache: &cache)
-    }
-  }
 }
 
 private extension GeometryScene {
@@ -229,14 +235,17 @@ private extension GeometryScene {
     guard entities[id] == nil else {
       throw GeometryError.duplicateEntity(id)
     }
+    try validateLiteralInputs(entity)
     entities[id] = entity
     orderedIDs.append(id)
     updateReverseDependencies(for: id, from: [], to: entity.dependencyIDs)
+    updateParameterDependents(for: id, from: [], to: entity.referencedParameterIDs)
     do {
-      try resolveAndCache([id])
+      try resolveAndCacheRecoverably([id])
       return id
     } catch {
       updateReverseDependencies(for: id, from: entity.dependencyIDs, to: [])
+      updateParameterDependents(for: id, from: entity.referencedParameterIDs, to: [])
       entities.removeValue(forKey: id)
       orderedIDs.removeAll { $0 == id }
       throw error
@@ -248,6 +257,8 @@ extension GeometryScene {
   private enum CodingKeys: CodingKey {
     case schemaVersion
     case coordinateSystem
+    case orderedParameterIDs
+    case parameters
     case orderedIDs
     case entities
   }
@@ -260,10 +271,18 @@ extension GeometryScene {
       throw GeometryError.unsupportedSchemaVersion(schemaVersion)
     }
     coordinateSystem = try container.decode(CoordinateSystem2D.self, forKey: .coordinateSystem)
+    orderedParameterIDs =
+      try container.decodeIfPresent([ScalarParameterID].self, forKey: .orderedParameterIDs) ?? []
+    parameters =
+      try container.decodeIfPresent(
+        [ScalarParameterID: ScalarParameter].self,
+        forKey: .parameters) ?? [:]
     orderedIDs = try container.decode([GeometryID].self, forKey: .orderedIDs)
     entities = try container.decode([GeometryID: GeometryEntity].self, forKey: .entities)
     reverseDependencies = Self.makeReverseDependencies(from: entities)
+    parameterDependents = Self.makeParameterDependents(from: entities)
     resolvedEntities = [:]
+    evaluationFailures = [:]
     try rebuildResolvedEntities()
   }
 
@@ -273,6 +292,8 @@ extension GeometryScene {
     var container = encoder.container(keyedBy: CodingKeys.self)
     try container.encode(Self.currentSchemaVersion, forKey: .schemaVersion)
     try container.encode(coordinateSystem, forKey: .coordinateSystem)
+    try container.encode(orderedParameterIDs, forKey: .orderedParameterIDs)
+    try container.encode(parameters, forKey: .parameters)
     try container.encode(orderedIDs, forKey: .orderedIDs)
     try container.encode(entities, forKey: .entities)
   }
@@ -280,6 +301,8 @@ extension GeometryScene {
   /// Compares only semantic scene state; derived dependency indexes are excluded.
   public static func == (lhs: GeometryScene, rhs: GeometryScene) -> Bool {
     lhs.coordinateSystem == rhs.coordinateSystem
+      && lhs.orderedParameterIDs == rhs.orderedParameterIDs
+      && lhs.parameters == rhs.parameters
       && lhs.orderedIDs == rhs.orderedIDs
       && lhs.entities == rhs.entities
   }
