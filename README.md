@@ -25,8 +25,24 @@ geometry. A host app remains responsible for rendering, gestures, selection, and
 
 ## Installation
 
-Add this repository as a Swift package dependency, then add `DynamicGeometry` to the target that
-owns the construction model.
+In Xcode, choose **File → Add Package Dependencies** and enter:
+
+```text
+https://github.com/kodlabs-in/DynamicGeometry.git
+```
+
+Select version `0.1.0` or add it to `Package.swift`:
+
+```swift
+dependencies: [
+  .package(
+    url: "https://github.com/kodlabs-in/DynamicGeometry.git",
+    from: "0.1.0"
+  )
+]
+```
+
+Then add `DynamicGeometry` to the target that owns the construction model.
 
 ## Minimal construction
 
@@ -50,7 +66,8 @@ For a touch-driven canvas whose y-axis points down, create the scene with
 try scene.movePoint(movingPoint, to: dragLocation)
 ```
 
-See `DynamicGeometrySandbox` beside this repository for a runnable unit-circle construction.
+See [DynamicGeometrySandbox](https://github.com/kodlabs-in/DynamicGeometrySandbox) for a runnable
+unit-circle construction.
 
 ## Development
 
