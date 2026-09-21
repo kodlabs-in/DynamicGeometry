@@ -1,0 +1,33 @@
+included:
+  - Package.swift
+  - Sources
+  - Tests
+
+strict: true
+
+disabled_rules:
+  - trailing_comma
+
+opt_in_rules:
+  - force_try
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+
+cyclomatic_complexity:
+  warning: 10
+  error: 15
+  ignores_case_statements: false
+
+line_length:
+  warning: 100
+  error: 120
+  ignores_comments: true
+  ignores_urls: true
+
+identifier_name:
+  excluded:
+    - id
+    - of
+    - URL
+    - x
+    - y
